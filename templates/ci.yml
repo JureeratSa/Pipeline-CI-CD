@@ -1,0 +1,86 @@
+# ต้นแบบ CI — copy ไปไว้ที่ .github/workflows/ci.yml ของโปรเจกต์ แล้วแก้บรรทัดที่มี "แก้"
+# ไม่มีเว็บ (Node) ลบ job web ทิ้งทั้งก้อน / ไม่ใช้ Alembic ลบ step "ตรวจ migration"
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"                                   # แก้: เวอร์ชันที่โปรเจกต์ใช้
+
+      - name: Lint (ruff — เฉพาะข้อผิดพลาดจริง เช่นตัวแปรไม่ได้ประกาศ, import ไม่ได้ใช้)
+        run: |
+          pip install ruff
+          ruff check --select F,E9 backend                         # แก้: โฟลเดอร์โค้ด Python
+
+      - name: ตรวจ migration (แตะเฉพาะตารางของเรา)
+        run: >                                                     # แก้: path ของ alembic/versions และ models
+          python scripts/check_migrations.py
+          --versions backend/alembic/versions
+          --models backend/app/models.py
+
+      - name: Build Docker image
+        run: docker build -t app-backend backend                   # แก้: โฟลเดอร์ที่มี Dockerfile
+
+      # เปิดแอปใน image ด้วยค่าหลอก — ไม่ได้ต่อฐานข้อมูลจริง แค่ดูว่า import ผ่าน
+      - name: Smoke test
+        run: |
+          docker run --rm -e SECRET_KEY=ci-dummy \
+            app-backend python -c "from app.main import app"       # แก้: env ที่แอปบังคับ + module หลัก
+
+      # ช่องโหว่ที่ยังแก้ไม่ได้ ให้เพิ่ม --ignore-vuln <ID> ทีละตัว พร้อมเขียนเหตุผลไว้ข้างบน
+      - name: Dependency audit (pip-audit)
+        run: |
+          docker run --rm --entrypoint "" app-backend sh -c \
+            'pip install -q --user pip-audit && ~/.local/bin/pip-audit --skip-editable'
+
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend                                # แก้: โฟลเดอร์เว็บ
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json        # แก้: ให้ตรงกับโฟลเดอร์เว็บ
+      - run: npm ci
+      - run: npm run build
+      - name: Dependency audit (npm audit — ระดับ high ขึ้นไป)
+        run: npm audit --omit=dev --audit-level=high
+
+  # สแกนเฉพาะ commit ที่เพิ่งเข้ามา — ถ้าสแกนทั้ง history แล้วเคยมีรหัสผ่านหลุดในอดีต จะแดงตลอด
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan new commits
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz gitleaks
+          if [ "$EVENT" = pull_request ]; then RANGE="$PR_BASE..$GITHUB_SHA"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then RANGE="origin/main..$GITHUB_SHA"  # branch ใหม่
+          else RANGE="$BEFORE..$GITHUB_SHA"; fi
+          echo "ช่วงที่สแกน: $RANGE"
+          ./gitleaks git --no-banner --redact --log-opts="$RANGE" .

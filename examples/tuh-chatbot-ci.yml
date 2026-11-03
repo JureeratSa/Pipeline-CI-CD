@@ -1,0 +1,97 @@
+name: CI
+
+# ตรวจโค้ดอัตโนมัติทุกครั้งที่ push (ทุก branch) และทุก PR เข้า main — ไม่ผ่าน = ขึ้นกากบาทแดง ห้าม merge
+# ไม่มี test ที่ต่อฐานข้อมูลจริง (ฐานข้อมูลอยู่ในเครือข่ายโรงพยาบาล GitHub ต่อไม่ถึง) — ตรวจหลัง deploy ด้วย
+# infra/scripts/deploy.py แทน
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    name: Backend (services/api)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint (ruff — เฉพาะข้อผิดพลาดจริง เช่นตัวแปรไม่ได้ประกาศ, import ไม่ได้ใช้)
+        run: |
+          pip install ruff
+          ruff check --select F,E9 services/api/app services/api/alembic services/api/scripts infra/scripts
+
+      - name: Migration แตะเฉพาะตารางของแชทบอท (ฐานข้อมูลใช้ร่วมกับระบบอื่น)
+        run: python infra/scripts/check_migrations.py
+
+      # build แบบเดียวกับ production (docker-compose.yml ส่ง WITH_MSSQL=true)
+      - name: Build Docker image
+        run: docker build --build-arg WITH_MSSQL=true -t tuh-chatbot-api services/api
+
+      # เปิดแอปขึ้นมาจริงใน image (ค่าในนี้เป็นค่าหลอก — แค่ให้ Settings ผ่าน ไม่ได้ต่อฐานข้อมูล)
+      - name: Smoke test (import แอป)
+        run: |
+          docker run --rm --no-healthcheck \
+            -e DB_ENGINE=mssql -e DB_HOST=ci -e DB_USER=ci -e DB_PASSWORD=ci \
+            -e JWT_SECRET_KEY=ci-placeholder-not-a-real-secret-0123456789abcdef \
+            tuh-chatbot-api python -c "from app.main import app; print('routes:', len(app.routes))"
+
+      # ช่องโหว่ที่ยกเว้นไว้ (ตรวจ 2026-11-02) — มีตัวใหม่เพิ่มเมื่อไหร่ CI ล้ม:
+      #   chromadb 1.5.9: PYSEC-2026-311/3813/3814/3815 ยังไม่มีเวอร์ชันที่แก้ — ใช้ ChromaDB แบบฝังใน process ไม่เปิดเป็น server
+      #   setuptools 81: PYSEC-2026-3447, GHSA-xmj3-9gf7-h52w แก้ใน 83+ แต่ torch 2.12 บังคับ < 82 — ใช้แค่ตอนติดตั้ง ไม่ใช่ตอนรัน
+      - name: Dependency audit (pip-audit)
+        run: |
+          docker run --rm --no-healthcheck --entrypoint "" tuh-chatbot-api sh -c '
+            pip install -q --user pip-audit && ~/.local/bin/pip-audit --skip-editable \
+              --ignore-vuln PYSEC-2026-311 --ignore-vuln PYSEC-2026-3813 \
+              --ignore-vuln PYSEC-2026-3814 --ignore-vuln PYSEC-2026-3815 \
+              --ignore-vuln PYSEC-2026-3447 --ignore-vuln GHSA-xmj3-9gf7-h52w'
+
+  web:
+    name: Web (${{ matrix.app }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [chat-web, admin-web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/${{ matrix.app }}/package-lock.json
+      - name: Install & build
+        working-directory: apps/${{ matrix.app }}
+        run: |
+          npm ci
+          npm run build
+      - name: Dependency audit (npm audit — ล้มเมื่อเจอระดับ high ขึ้นไปในสิ่งที่ส่งถึงผู้ใช้)
+        working-directory: apps/${{ matrix.app }}
+        run: npm audit --omit=dev --audit-level=high
+
+  # repo เป็น public และเคยมีรหัสผ่านจริงหลุดเข้า git — ตรวจทุก commit ใหม่ว่าไม่มี secret ติดมา
+  # สแกนเฉพาะ commit ที่เพิ่งเข้ามา (ประวัติเก่ามีรหัสผ่าน TiDB ที่หลุดไปแล้วค้างอยู่ — สแกนทั้งหมดจะล้มตลอด)
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan new commits
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz gitleaks
+          if [ "$EVENT" = pull_request ]; then RANGE="$PR_BASE..$GITHUB_SHA"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then RANGE="origin/main..$GITHUB_SHA"  # branch ใหม่
+          else RANGE="$BEFORE..$GITHUB_SHA"; fi
+          echo "ช่วงที่สแกน: $RANGE"
+          ./gitleaks git --no-banner --redact --log-opts="$RANGE" .
